@@ -280,8 +280,17 @@
     document.getElementById('amc-auth-email').textContent = user.email;
     document.getElementById('amc-auth-error').classList.remove('visible');
 
-    // Verify with backend
-    jsonpCall({ action: 'verifyAuth', id_token: idToken })
+   // Verify with backend
+    fetch(AUTH_CONFIG.VERIFY_URL, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action: 'verifyAuth', id_token: idToken })
+    })
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function(res) {
         if (res.success && res.authorized) {
           authState.token = idToken;
