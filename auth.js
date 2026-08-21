@@ -1,5 +1,5 @@
 // ============================================================
-// AM-CRAFT AUTH MODULE v1.0
+// AM-CRAFT AUTH MODULE v1.1
 // ============================================================
 // Universal Google Sign-In gate for all AM-Craft GitHub Pages apps.
 //
@@ -15,6 +15,16 @@
 //   5. On failure → show error
 //
 // CONFIGURATION: Edit the CONFIG object below.
+//
+// v1.1 CHANGES:
+//   - Verification now uses JSONP GET (jsonpCall) instead of fetch POST.
+//     The POST hit a 302 redirect to script.googleusercontent.com and
+//     intermittently landed in the backend's doGet AUTH_ENFORCE guard,
+//     returning "Verification failed: HTTP 404" / "Authentication required".
+//     JSONP GET routes straight to doGet's verifyAuth branch (which sits
+//     above the guard) and matches the pattern used everywhere else.
+//   - JWT payload is now decoded UTF-8 safe (fixes mojibake names like
+//     "KozaÄ enko" → "Kozačenko").
 // ============================================================
 
 (function() {
@@ -264,12 +274,28 @@
     );
   }
 
+  // --- Decode a JWT payload, UTF-8 safe (fixes mojibake in non-ASCII names) ---
+  function decodeJwtPayload(idToken) {
+    var part = idToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (part.length % 4) part += '=';
+    var bin = atob(part);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  }
+
   function handleCredentialResponse(response) {
     var idToken = response.credential;
 
-    // Decode JWT for user info
-    var payload = JSON.parse(atob(idToken.split('.')[1]));
-    var user = { name: payload.name, email: payload.email, picture: payload.picture };
+    // Decode JWT for user info (UTF-8 safe)
+    var user;
+    try {
+      var payload = decodeJwtPayload(idToken);
+      user = { name: payload.name, email: payload.email, picture: payload.picture };
+    } catch (e) {
+      showAuthError('Could not read sign-in token.');
+      return;
+    }
 
     // Show loading
     document.getElementById('amc-gsi-btn').style.display = 'none';
@@ -280,25 +306,20 @@
     document.getElementById('amc-auth-email').textContent = user.email;
     document.getElementById('amc-auth-error').classList.remove('visible');
 
-   // Verify with backend
-    fetch(AUTH_CONFIG.VERIFY_URL, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({ action: 'verifyAuth', id_token: idToken })
-    })
-      .then(function(r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
+    // Verify with backend — JSONP GET.
+    // Routes to doGet's verifyAuth branch (above the AUTH_ENFORCE guard),
+    // matching the reliable pattern used across the rest of the system.
+    // Avoids the POST → 302 redirect that intermittently returned
+    // "Authentication required" / HTTP 404.
+    jsonpCall({ action: 'verifyAuth', id_token: idToken })
       .then(function(res) {
-        if (res.success && res.authorized) {
+        if (res && res.success && res.authorized) {
           authState.token = idToken;
           authState.user = user;
           setSession({ token: idToken, user: user });
           onAuthSuccess(user);
         } else {
-          showAuthError(res.message || 'Access denied.');
+          showAuthError((res && res.message) || 'Access denied.');
         }
       })
       .catch(function(err) {
