@@ -1,5 +1,5 @@
 // ============================================================
-// AM-CRAFT AUTH MODULE v1.1
+// AM-CRAFT AUTH MODULE v1.2
 // ============================================================
 // Universal Google Sign-In gate for all AM-Craft GitHub Pages apps.
 //
@@ -11,20 +11,25 @@
 //   1. Hide all page content
 //   2. Show AM-Craft login screen
 //   3. Verify user with Apps Script backend
-//   4. On success → show page content + add user pill to page
-//   5. On failure → show error
+//   4. On success -> show page content + add user pill to page
+//   5. On failure -> show error
 //
 // CONFIGURATION: Edit the CONFIG object below.
 //
-// v1.1 CHANGES:
-//   - Verification now uses JSONP GET (jsonpCall) instead of fetch POST.
-//     The POST hit a 302 redirect to script.googleusercontent.com and
-//     intermittently landed in the backend's doGet AUTH_ENFORCE guard,
-//     returning "Verification failed: HTTP 404" / "Authentication required".
-//     JSONP GET routes straight to doGet's verifyAuth branch (which sits
-//     above the guard) and matches the pattern used everywhere else.
-//   - JWT payload is now decoded UTF-8 safe (fixes mojibake names like
-//     "KozaÄ enko" → "Kozačenko").
+// CHANGELOG:
+//   v1.2 - Hardened jsonpCall: script tag is now removed only when the
+//          request actually finishes (callback / timeout / error), not on
+//          a blind 500ms timer that yanked slow requests mid-flight. Added
+//          one automatic retry (800ms) so Apps Script cold-start blips
+//          surface as "Network error" only after TWO consecutive failures.
+//   v1.1 - Verification switched from fetch POST to JSONP GET. The POST hit
+//          a 302 redirect to script.googleusercontent.com and intermittently
+//          landed in the backend's doGet AUTH_ENFORCE guard, returning
+//          "Verification failed: HTTP 404" / "Authentication required".
+//          JSONP GET routes straight to doGet's verifyAuth branch (above the
+//          guard) and matches the pattern used everywhere else.
+//        - JWT payload decoded UTF-8 safe (fixes mojibake names, e.g.
+//          "KozaA enko" -> "Kozacenko").
 // ============================================================
 
 (function() {
@@ -32,7 +37,7 @@
 
   // --- CONFIG ---
   var AUTH_CONFIG = {
-    GOOGLE_CLIENT_ID: '51370093929-sh4ts8p1ipu41u77j9vplq8tddp3sc8m.apps.googleusercontent.com',  // ← Your OAuth Client ID
+    GOOGLE_CLIENT_ID: '51370093929-sh4ts8p1ipu41u77j9vplq8tddp3sc8m.apps.googleusercontent.com',  // <- Your OAuth Client ID
     VERIFY_URL: 'https://script.google.com/macros/s/AKfycbzErJwC-vAczZ4u8piJzdVgtCCeQlGy7IEfT5yPxoEAvqc4o0jWu3d4dRWaIj9vQy_f/exec',
     SESSION_KEY: 'amcraft_auth',
     SESSION_TTL: 8 * 60 * 60 * 1000,  // 8 hours
@@ -64,20 +69,49 @@
     try { sessionStorage.removeItem(AUTH_CONFIG.SESSION_KEY); } catch(e) {}
   }
 
-  // --- JSONP ---
+  // --- JSONP (hardened: clean teardown + one retry on transient failure) ---
   var _jcb = 0;
-  function jsonpCall(params) {
+  function jsonpCall(params, _retried) {
     return new Promise(function(resolve, reject) {
       var cb = '__acb' + (_jcb++);
-      var t = setTimeout(function() { delete window[cb]; reject(new Error('Timeout')); }, 20000);
-      window[cb] = function(d) { clearTimeout(t); delete window[cb]; resolve(d); };
+      var s = document.createElement('script');
+      var done = false;
+
+      function cleanup() {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        delete window[cb];
+        try { s.remove(); } catch(e) {}
+      }
+
+      var t = setTimeout(function() {
+        cleanup();
+        reject(new Error('Timeout'));
+      }, 20000);
+
+      window[cb] = function(d) {
+        cleanup();
+        resolve(d);
+      };
+
       var qs = 'callback=' + cb;
       for (var k in params) qs += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
-      var s = document.createElement('script');
+
+      s.onerror = function() {
+        cleanup();
+        // One automatic retry -- covers Apps Script cold-start / transient edge failures
+        if (!_retried) {
+          setTimeout(function() {
+            jsonpCall(params, true).then(resolve, reject);
+          }, 800);
+        } else {
+          reject(new Error('Network error'));
+        }
+      };
+
       s.src = AUTH_CONFIG.VERIFY_URL + '?' + qs;
-      s.onerror = function() { clearTimeout(t); delete window[cb]; reject(new Error('Network error')); };
       document.body.appendChild(s);
-      setTimeout(function() { try { s.remove(); } catch(e){} }, 500);
     });
   }
 
@@ -126,7 +160,6 @@
 
     '.amc-auth-footer{margin-top:28px;font-size:11px;color:#94A3B8;}' +
 
-    /* User pill - floats top-right on any page */
     '#amcraft-auth-pill{' +
     '  position:fixed;top:8px;right:12px;z-index:99998;' +
     '  display:none;align-items:center;gap:8px;' +
@@ -165,7 +198,7 @@
         '<div class="amc-auth-gsi-wrap"><div id="amc-gsi-btn"></div></div>' +
         '<div class="amc-auth-loading" id="amc-auth-loading">' +
           '<div class="amc-auth-spinner"></div>' +
-          '<div class="amc-auth-loading-text">Verifying access…</div>' +
+          '<div class="amc-auth-loading-text">Verifying access...</div>' +
         '</div>' +
         '<div class="amc-auth-user" id="amc-auth-user">' +
           '<img class="amc-auth-avatar" id="amc-auth-avatar" src="" alt="">' +
@@ -206,12 +239,10 @@
   }
 
   function injectUI() {
-    // CSS
     var style = document.createElement('style');
     style.textContent = CSS;
     document.head.appendChild(style);
 
-    // HTML
     var wrap = document.createElement('div');
     wrap.innerHTML = HTML;
     while (wrap.firstChild) document.body.appendChild(wrap.firstChild);
@@ -223,7 +254,6 @@
     user: null
   };
 
-  // Expose globally so host pages can access auth info
   window.amcraftAuth = {
     getUser: function() { return authState.user; },
     getToken: function() { return authState.token; },
@@ -306,11 +336,12 @@
     document.getElementById('amc-auth-email').textContent = user.email;
     document.getElementById('amc-auth-error').classList.remove('visible');
 
-    // Verify with backend — JSONP GET.
+    // Verify with backend -- JSONP GET.
     // Routes to doGet's verifyAuth branch (above the AUTH_ENFORCE guard),
     // matching the reliable pattern used across the rest of the system.
-    // Avoids the POST → 302 redirect that intermittently returned
-    // "Authentication required" / HTTP 404.
+    // Avoids the POST -> 302 redirect that intermittently returned
+    // "Authentication required" / HTTP 404. jsonpCall retries once on a
+    // transient failure (cold start) before surfacing "Network error".
     jsonpCall({ action: 'verifyAuth', id_token: idToken })
       .then(function(res) {
         if (res && res.success && res.authorized) {
@@ -338,8 +369,6 @@
   function onAuthSuccess(user) {
     hideOverlay();
     showPill(user);
-
-    // Dispatch custom event so host pages can react
     window.dispatchEvent(new CustomEvent('amcraft-auth-success', { detail: { user: user, token: authState.token } }));
   }
 
@@ -351,7 +380,6 @@
     authState.user = null;
     clearSession();
 
-    // Reset UI
     document.getElementById('amcraft-auth-pill').classList.remove('visible');
     document.getElementById('amcraft-auth-pill-menu').classList.remove('open');
     document.getElementById('amc-auth-loading').classList.remove('visible');
@@ -398,7 +426,6 @@
     injectUI();
     setupPillMenu();
 
-    // Check existing session
     var session = getSession();
     if (session && session.token && session.user) {
       authState.token = session.token;
@@ -407,16 +434,14 @@
       return;
     }
 
-    // No session — show login
     showOverlay();
-    showPageContent(); // Overlay covers everything, so page visibility is fine
+    showPageContent();
 
     injectGSI().then(function() {
       initGSIButton();
     });
   }
 
-  // Run when DOM is ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
