@@ -1,36 +1,27 @@
 // ============================================================
-// AM-CRAFT AUTH MODULE v2.0
+// AM-CRAFT AUTH MODULE v2.1
 // ============================================================
 // Universal Google Sign-In gate for all AM-Craft GitHub Pages apps.
 //
-// USAGE: Add this ONE line to any HTML page <head> or before </body>:
+// USAGE: <script src="https://amcraft-it.github.io/auth/auth.js"></script>
 //
-//   <script src="https://amcraft-it.github.io/auth/auth.js"></script>
-//
-// ---- HOW v2.0 WORKS (background / phone-proof) ----
-// 1. Google issues a signed ID token (One Tap can do this with no click for
-//    users already signed into Google -> "background" login).
-// 2. The gate opens IMMEDIATELY from that token's claims (domain check),
-//    with NO blocking backend call -- this is what fixes the phone
-//    "Network error": the fragile verify round-trip no longer gates entry.
-// 3. In the BACKGROUND (fire-and-forget), auth.js still calls the backend to
-//    (a) write the audit log, (b) mint a day-token used to secure data
-//    backends, and (c) honour revocation. A failure here never blocks the
-//    user; it just means no day-token yet (retried on next load).
-//
-// The day-token is exposed as window.amcraftAuth.getDayToken() and apps
-// whose backend enforces auth must send it on every data call.
-//
-// REQUIREMENT: the backend web-app deployment must be Access: "Anyone"
-// (NOT "Anyone with a Google account"), or the background mint/verify call
-// fails on phones.
+// ---- WHAT v2.1 FIXES ----
+// Colleagues were getting "Finishing sign-in" forever when the mint endpoint
+// (the dashboard backend) was cold at their login: the single mint attempt
+// timed out, no day-token was issued, and it never retried. v2.1 makes the
+// mint robust:
+//   * mint retries with backoff over ~70s, so a cold start just delays the
+//     token by a few seconds instead of blocking writes all day;
+//   * on reload, if the session has no day-token yet, it re-mints;
+//   * if the stored Google token has expired (so it can't mint), it silently
+//     asks Google for a fresh credential and mints with that.
+// Pair with the keep-warm trigger on the DASHBOARD backend (the mint endpoint).
 //
 // CHANGELOG:
-//   v2.0 - Client-side domain gate (instant, background, phone-proof).
-//          Server verify moved to a non-blocking background step that also
-//          mints a day-token (window.amcraftAuth.getDayToken()) and fires an
-//          "amcraft-auth-ready" event when it is available. Revocation still
-//          honoured via the background check.
+//   v2.1 - Robust mint: backoff retries + re-mint on reload + silent
+//          credential refresh when the stored token has expired.
+//   v2.0 - Client-side domain gate (instant, background, phone-proof);
+//          background mint of a day-token exposed via getDayToken().
 //   v1.4 - Session expires at next local midnight (once-a-day login).
 //   v1.3 - localStorage persistence + silent background re-verify.
 //   v1.2 - Hardened jsonpCall (clean teardown + one retry).
@@ -44,16 +35,20 @@
   var AUTH_CONFIG = {
     GOOGLE_CLIENT_ID: '51370093929-sh4ts8p1ipu41u77j9vplq8tddp3sc8m.apps.googleusercontent.com',
     VERIFY_URL: 'https://script.google.com/macros/s/AKfycbzErJwC-vAczZ4u8piJzdVgtCCeQlGy7IEfT5yPxoEAvqc4o0jWu3d4dRWaIj9vQy_f/exec',
-    ALLOWED_DOMAIN: 'am-craft.com',        // client-side gate: only this Workspace domain passes
+    ALLOWED_DOMAIN: 'am-craft.com',
     SESSION_KEY: 'amcraft_auth',
-    SESSION_TTL: 24 * 60 * 60 * 1000,      // safety cap only; real expiry = next local midnight
+    SESSION_TTL: 24 * 60 * 60 * 1000,   // safety cap; real expiry = next local midnight
     FONT_URL: 'https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap'
   };
+
+  // Backoff schedule (ms after login) for minting the day-token. Spans ~70s so
+  // even a full cold start of the mint endpoint is covered by a later attempt.
+  var MINT_DELAYS = [0, 1500, 3000, 6000, 12000, 20000, 30000];
 
   // --- SESSION (localStorage; expires at next local midnight) ---
   function nextMidnightTs() {
     var d = new Date();
-    d.setHours(24, 0, 0, 0); // 00:00:00.000 of the next day, local time
+    d.setHours(24, 0, 0, 0);
     return d.getTime();
   }
 
@@ -80,7 +75,6 @@
   }
 
   function patchSession(patch) {
-    // Merge fields (e.g. dayToken) into the stored session without resetting exp.
     try {
       var raw = localStorage.getItem(AUTH_CONFIG.SESSION_KEY);
       if (!raw) return;
@@ -111,7 +105,6 @@
       }
 
       var t = setTimeout(function() { cleanup(); reject(new Error('Timeout')); }, 20000);
-
       window[cb] = function(d) { cleanup(); resolve(d); };
 
       var qs = 'callback=' + cb;
@@ -119,11 +112,8 @@
 
       s.onerror = function() {
         cleanup();
-        if (!_retried) {
-          setTimeout(function() { jsonpCall(params, true).then(resolve, reject); }, 800);
-        } else {
-          reject(new Error('Network error'));
-        }
+        if (!_retried) { setTimeout(function() { jsonpCall(params, true).then(resolve, reject); }, 800); }
+        else { reject(new Error('Network error')); }
       };
 
       s.src = AUTH_CONFIG.VERIFY_URL + '?' + qs;
@@ -256,11 +246,13 @@
 
   // --- CORE STATE ---
   var authState = { token: null, user: null, dayToken: null };
+  var _gsiInited = false;
+  var _minting = false;
 
   window.amcraftAuth = {
     getUser: function() { return authState.user; },
     getToken: function() { return authState.token; },
-    getDayToken: function() { return authState.dayToken; },   // <-- send this on data calls
+    getDayToken: function() { return authState.dayToken; },
     isReady: function() { return !!authState.dayToken; },
     signOut: signOut,
     isAuthenticated: function() { return !!authState.user; }
@@ -286,28 +278,47 @@
   function showPill(user) {
     var pill = document.getElementById('amcraft-auth-pill');
     document.getElementById('amc-pill-avatar').src = user.picture || '';
-    document.getElementById('amc-pill-name').textContent = user.name.split(' ')[0];
+    document.getElementById('amc-pill-name').textContent = (user.name || '').split(' ')[0];
     document.getElementById('amc-pill-email').textContent = user.email;
     pill.classList.add('visible');
   }
 
-  function initGSIButton() {
-    if (!window.google || !window.google.accounts) return;
-    google.accounts.id.initialize({
-      client_id: AUTH_CONFIG.GOOGLE_CLIENT_ID,
-      callback: handleCredentialResponse,
-      auto_select: true,               // background: auto-issues a token for returning users
-      cancel_on_tap_outside: false
-    });
-    google.accounts.id.renderButton(
-      document.getElementById('amc-gsi-btn'),
-      { theme: 'outline', size: 'large', width: 280, text: 'signin_with', shape: 'rectangular' }
-    );
-    // Also show One Tap so it can complete with no button click.
-    try { google.accounts.id.prompt(); } catch (e) {}
+  // --- GSI init (shared) ---
+  function ensureGSIInitialized() {
+    if (!window.google || !window.google.accounts) return false;
+    if (!_gsiInited) {
+      google.accounts.id.initialize({
+        client_id: AUTH_CONFIG.GOOGLE_CLIENT_ID,
+        callback: handleCredentialResponse,
+        auto_select: true,
+        cancel_on_tap_outside: false
+      });
+      _gsiInited = true;
+    }
+    return true;
   }
 
-  // --- UTF-8 safe JWT payload decode ---
+  function initGSIButton() {
+    injectGSI().then(function() {
+      if (!ensureGSIInitialized()) return;
+      google.accounts.id.renderButton(
+        document.getElementById('amc-gsi-btn'),
+        { theme: 'outline', size: 'large', width: 280, text: 'signin_with', shape: 'rectangular' }
+      );
+      try { google.accounts.id.prompt(); } catch (e) {}
+    });
+  }
+
+  // Silently ask Google for a fresh credential (used when the stored token
+  // expired and we still need to mint a day-token).
+  function trySilentRefresh() {
+    injectGSI().then(function() {
+      if (!ensureGSIInitialized()) return;
+      try { google.accounts.id.prompt(); } catch (e) {}
+    });
+  }
+
+  // --- UTF-8 safe JWT decode ---
   function decodeJwtPayload(idToken) {
     var part = idToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
     while (part.length % 4) part += '=';
@@ -317,10 +328,7 @@
     return JSON.parse(new TextDecoder('utf-8').decode(bytes));
   }
 
-  // --- Client-side gate: trust the Google-signed token's claims ---
-  // Checks audience, issuer, expiry, verified email, and Workspace domain.
-  // (Signature itself is not re-verified in-browser; real data protection is
-  //  enforced server-side by the backend that validates the minted day-token.)
+  // --- Client-side gate ---
   function clientGateCheck(payload) {
     if (!payload) return { ok: false, why: 'Could not read sign-in token.' };
     if (payload.aud !== AUTH_CONFIG.GOOGLE_CLIENT_ID)
@@ -363,28 +371,67 @@
     setSession({ token: idToken, user: user });
     onAuthSuccess(user);
 
-    // Background: mint day-token + audit log + honour revocation.
-    mintAndAudit(idToken);
+    // Mint the day-token with retries (fresh token, so this should succeed).
+    _minting = false;
+    mintWithRetry(idToken, 0);
   }
 
-  // Background server call: verifyAuth returns { success, authorized, message, dayToken }.
-  // Non-blocking. Only an explicit "authorized:false" (not a token/network issue)
-  // signs the user out.
-  function mintAndAudit(idToken) {
+  // --- Robust day-token mint (backoff retries + silent refresh) ---
+  function mintWithRetry(idToken, i) {
+    if (authState.dayToken) return;         // already have it
+    if (_minting) return;                   // an attempt is already in flight
+    _minting = true;
+
     jsonpCall({ action: 'verifyAuth', id_token: idToken })
       .then(function(res) {
+        _minting = false;
+        if (authState.dayToken) return;
+
+        // Definitive "not authorized" that is NOT a token-freshness issue -> sign out.
         if (res && res.success === true && res.authorized === false) {
           var msg = (res.message || '').toLowerCase();
           var tokenish = msg.indexOf('token') !== -1 || msg.indexOf('expired') !== -1 || msg.indexOf('invalid') !== -1;
           if (!tokenish) { forceReauth('Your access has changed. Please sign in again.'); return; }
+          // Stored token expired/invalid and we still have no day-token:
+          // ask Google (silently) for a fresh credential, then mint with that.
+          if (!authState.dayToken) trySilentRefresh();
+          return;
         }
+
         if (res && res.dayToken) {
           authState.dayToken = res.dayToken;
           patchSession({ dayToken: res.dayToken });
           window.dispatchEvent(new CustomEvent('amcraft-auth-ready', { detail: { dayToken: res.dayToken } }));
+          return;
         }
+
+        // No token yet, no clear denial (e.g. cold-start hiccup) -> retry.
+        scheduleMintRetry(idToken, i);
       })
-      .catch(function() { /* transient -- keep local session, no dayToken yet */ });
+      .catch(function() {
+        _minting = false;
+        scheduleMintRetry(idToken, i);     // timeout/network -> retry
+      });
+  }
+
+  function scheduleMintRetry(idToken, i) {
+    if (authState.dayToken) return;
+    if (i + 1 >= MINT_DELAYS.length) return; // window exhausted; next page load will retry
+    setTimeout(function() { mintWithRetry(idToken, i + 1); }, MINT_DELAYS[i + 1]);
+  }
+
+  function showAuthError(msg) {
+    document.getElementById('amc-auth-loading').classList.remove('visible');
+    document.getElementById('amc-gsi-btn').style.display = '';
+    var el = document.getElementById('amc-auth-error');
+    el.textContent = msg;
+    el.classList.add('visible');
+  }
+
+  function onAuthSuccess(user) {
+    hideOverlay();
+    showPill(user);
+    window.dispatchEvent(new CustomEvent('amcraft-auth-success', { detail: { user: user, token: authState.token } }));
   }
 
   function forceReauth(message) {
@@ -402,22 +449,8 @@
     err.classList.add('visible');
     hidePageContent();
     showOverlay();
-    injectGSI().then(function() { initGSIButton(); });
+    initGSIButton();
     window.dispatchEvent(new CustomEvent('amcraft-auth-signout'));
-  }
-
-  function showAuthError(msg) {
-    document.getElementById('amc-auth-loading').classList.remove('visible');
-    document.getElementById('amc-gsi-btn').style.display = '';
-    var el = document.getElementById('amc-auth-error');
-    el.textContent = msg;
-    el.classList.add('visible');
-  }
-
-  function onAuthSuccess(user) {
-    hideOverlay();
-    showPill(user);
-    window.dispatchEvent(new CustomEvent('amcraft-auth-success', { detail: { user: user, token: authState.token } }));
   }
 
   function signOut() {
@@ -471,23 +504,29 @@
 
     var session = getSession();
     if (session && session.token && session.user) {
-      // Restore instantly from cache (background, no login screen).
       authState.token = session.token;
       authState.user = session.user;
       authState.dayToken = session.dayToken || null;
       onAuthSuccess(session.user);
+
       if (authState.dayToken) {
         window.dispatchEvent(new CustomEvent('amcraft-auth-ready', { detail: { dayToken: authState.dayToken } }));
+        // Light background refresh of audit/revocation (won't overwrite a good token).
+        mintWithRetry(session.token, MINT_DELAYS.length - 2);
+      } else {
+        // Session exists but never got a day-token (previous mint failed).
+        // Retry hard; if the stored token is stale, mintWithRetry triggers a
+        // silent credential refresh.
+        injectGSI().then(function() { ensureGSIInitialized(); });
+        mintWithRetry(session.token, 0);
       }
-      // Refresh day-token + audit + revocation in the background.
-      mintAndAudit(session.token);
       return;
     }
 
     // No session -> show login; One Tap / auto_select may complete with no click.
     showOverlay();
     showPageContent();
-    injectGSI().then(function() { initGSIButton(); });
+    initGSIButton();
   }
 
   if (document.readyState === 'loading') {
